@@ -1,0 +1,355 @@
+"""Forecast — probabilistic ONI fan chart + model verification.
+
+Run with::
+
+    panel serve dashboard/pages/03_forecast.py --show
+
+Shows recent ONI history, the SARIMA / LSTM / Ensemble forward forecasts with
+prediction intervals, landmark thresholds, and — critically — the *spread* of
+external operational forecasts (CPC dynamical models vs a skeptical published
+estimate). A skill-by-lead panel reports ACC against persistence so the viewer
+can judge how far out each model is actually trustworthy.
+
+Requires the forecasting engine to have been run::
+
+    python forecasting/baselines/arima_model.py
+    python forecasting/ml_models/lstm_enso.py
+    python forecasting/ensemble.py
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pandas as pd
+import panel as pn
+import plotly.graph_objects as go
+
+_PAGE_DIR = Path(__file__).resolve().parent
+_DASH_DIR = _PAGE_DIR.parent
+_ROOT = _DASH_DIR.parent
+sys.path.insert(0, str(_DASH_DIR))
+sys.path.insert(0, str(_ROOT / "data" / "ingest"))
+from theme import COLORS, CACHE_DIR, load_oni, style_figure  # noqa: E402
+
+try:
+    from weekly_nino34 import latest_weekly
+except Exception:  # noqa: BLE001
+    def latest_weekly():  # type: ignore[misc]
+        return None
+
+MODEL_COLORS = {
+    "SARIMA": COLORS["el_nino"],
+    "LSTM": COLORS["la_nina"],
+    "Ensemble": COLORS["teal"],
+}
+
+# External operational forecasts for the SON 2026 peak (from project brief) —
+# illustrate genuine disagreement; these are reference markers, not our output.
+EXTERNAL = [
+    {"label": "CPC / IRI dynamical (~strong–super, ≥+2.0)", "date": "2026-10-01",
+     "value": 2.0, "color": COLORS["el_nino"]},
+    {"label": "arXiv:2602.14773 (skeptical onset ~37.5%)", "date": "2026-10-01",
+     "value": 0.6, "color": COLORS["neutral"]},
+]
+
+RAW_CSS = f"""
+:host, body {{ background-color: {COLORS['bg']}; color: {COLORS['text']}; }}
+.enso-card {{ background: {COLORS['surface']};
+  border: 1px solid rgba(138,148,166,0.12); border-radius: 14px; padding: 18px 20px; }}
+.enso-title {{ font-size: 26px; font-weight: 800; margin: 0; }}
+.enso-subtitle {{ color: {COLORS['muted']}; font-size: 13px; margin-top: 2px; }}
+.enso-warn {{ background: rgba(244,98,58,0.08); border-left: 3px solid {COLORS['el_nino']};
+  border-radius: 8px; padding: 12px 16px; font-size: 12px; line-height: 1.5; }}
+"""
+
+pn.extension("plotly", raw_css=[RAW_CSS], sizing_mode="stretch_width")
+
+
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i : i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def build_fan_chart(history: pd.DataFrame, forecasts: pd.DataFrame) -> go.Figure:
+    """Recent ONI history + per-model forecast means with CI bands."""
+    fig = go.Figure()
+
+    # Threshold guides.
+    for y, label in ((0.5, "El Niño +0.5"), (2.0, "Very strong +2.0"), (-0.5, "La Niña −0.5")):
+        fig.add_hline(y=y, line=dict(color="rgba(138,148,166,0.35)", width=1, dash="dot"),
+                      annotation_text=label, annotation_position="right",
+                      annotation_font_color=COLORS["muted"], annotation_font_size=10)
+
+    # History (last ~6 years).
+    hist = history.tail(72)
+    fig.add_trace(go.Scatter(
+        x=hist["date"], y=hist["oni"], mode="lines", name="ONI (observed)",
+        line=dict(color=COLORS["text"], width=2),
+        hovertemplate="%{x|%b %Y}<br>ONI: %{y:+.2f}°C<extra></extra>"))
+
+    last_date, last_val = hist["date"].iloc[-1], hist["oni"].iloc[-1]
+
+    for model, grp in forecasts.groupby("model"):
+        color = MODEL_COLORS.get(model, COLORS["muted"])
+        # Prepend the last observation for visual continuity. Use a Series for
+        # the x-axis (datetime64) — Plotly/kaleido reject Python lists of
+        # Timestamp scalars but handle datetime64 Series/arrays fine.
+        connect = pd.DataFrame({"date": [last_date], "mean": [last_val],
+                                "upper": [last_val], "lower": [last_val]})
+        g = pd.concat([connect, grp.sort_values("date")], ignore_index=True)
+        fig.add_trace(go.Scatter(x=g["date"], y=g["upper"], mode="lines",
+                                 line=dict(width=0), showlegend=False, hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=g["date"], y=g["lower"], mode="lines", line=dict(width=0),
+                                 fill="tonexty", fillcolor=_hex_to_rgba(color, 0.13),
+                                 showlegend=False, hoverinfo="skip"))
+        fig.add_trace(go.Scatter(
+            x=g["date"], y=g["mean"], mode="lines", name=f"{model} forecast",
+            line=dict(color=color, width=2.4, dash="solid"),
+            hovertemplate="%{x|%b %Y}<br>" + model + ": %{y:+.2f}°C<extra></extra>"))
+
+    # External operational references (disagreement markers).
+    for ext in EXTERNAL:
+        fig.add_trace(go.Scatter(
+            x=[ext["date"]], y=[ext["value"]], mode="markers",
+            name=ext["label"], marker=dict(color=ext["color"], size=12, symbol="diamond",
+                                           line=dict(color=COLORS["text"], width=1)),
+            hovertemplate=ext["label"] + "<br>%{x|%b %Y}: ~%{y:+.1f}°C<extra></extra>"))
+
+    style_figure(fig, height=480, margin=dict(l=60, r=30, t=50, b=90),
+        title=dict(text="ONI forecast fan chart, model spread to 12 months",
+                   font=dict(size=16)),
+        yaxis=dict(title="ONI anomaly (°C)", gridcolor="rgba(138,148,166,0.12)"),
+        xaxis=dict(gridcolor="rgba(138,148,166,0.08)"),
+        legend=dict(orientation="h", yanchor="top", y=-0.14, x=0))
+    return fig
+
+
+def build_skill_chart(skill: pd.DataFrame) -> go.Figure:
+    """ACC vs lead per model, with the 0.5 'useful skill' line."""
+    fig = go.Figure()
+    fig.add_hline(y=0.5, line=dict(color="rgba(138,148,166,0.4)", width=1, dash="dash"),
+                  annotation_text="useful-skill 0.5", annotation_position="right",
+                  annotation_font_color=COLORS["muted"], annotation_font_size=10)
+    for model, grp in skill.groupby("model"):
+        grp = grp.sort_values("lead")
+        color = MODEL_COLORS.get(model, COLORS["muted"])
+        fig.add_trace(go.Scatter(
+            x=grp["lead"], y=grp["acc"], mode="lines+markers", name=model,
+            line=dict(color=color, width=2.2),
+            hovertemplate=model + " lead %{x}mo<br>ACC %{y:.3f}<extra></extra>"))
+    style_figure(fig, height=320, title=dict(
+        text="Forecast skill (ACC) vs lead, verified against persistence", font=dict(size=15)),
+        yaxis=dict(title="Anomaly correlation (ACC)", range=[0, 1.02],
+                   gridcolor="rgba(138,148,166,0.12)"),
+        xaxis=dict(title="Lead (months)", dtick=1, gridcolor="rgba(138,148,166,0.08)"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
+    return fig
+
+
+def build_variant_chart(df: pd.DataFrame) -> go.Figure:
+    """Does giving the LSTM other climate indices help? Only past the spring barrier.
+
+    Both arms trained on the identical span, split, seed and epoch budget — the extra
+    indices only start in 1951, so scoring a multivariate model against the production
+    1950-start run would have compared two different training sets and called the
+    difference a channel effect. Only the input width varies here.
+    """
+    fig = go.Figure()
+    fig.add_hline(y=0.5, line=dict(color="rgba(138,148,166,0.4)", width=1, dash="dash"),
+                  annotation_text="useful-skill 0.5", annotation_position="right",
+                  annotation_font_color=COLORS["muted"], annotation_font_size=10)
+    styling = {
+        "univariate": (COLORS["muted"], "ONI only"),
+        "multivariate": (COLORS["teal"], "ONI + 7 indices"),
+    }
+    for variant, grp in df.groupby("variant"):
+        colour, label = styling.get(variant, (COLORS["muted"], variant))
+        grp = grp.sort_values("lead")
+        fig.add_trace(go.Scatter(
+            x=grp["lead"], y=grp["acc"], mode="lines+markers", name=label,
+            line=dict(color=colour, width=2.2),
+            hovertemplate=label + " lead %{x}mo<br>ACC %{y:.3f}<extra></extra>"))
+    style_figure(fig, height=300, title=dict(
+        text="Does the LSTM improve with more channels?, paired, identical span & seed",
+        font=dict(size=15)),
+        yaxis=dict(title="Anomaly correlation (ACC)", range=[0, 1.02],
+                   gridcolor="rgba(138,148,166,0.12)"),
+        xaxis=dict(title="Lead (months)", dtick=1, gridcolor="rgba(138,148,166,0.08)"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
+    return fig
+
+
+def _variant_card() -> pn.viewable.Viewable:
+    """The channel experiment, with the result stated rather than left to the eye."""
+    path = CACHE_DIR / "skill_variants.parquet"
+    if not path.exists():
+        return pn.pane.HTML(
+            "<div class='enso-note'>Channel comparison not built, run "
+            "<code>forecasting/ml_models/lstm_exog.py</code>.</div>")
+
+    df = pd.read_parquet(path)
+    acc = df.pivot(index="lead", columns="variant", values="acc")
+    delta = acc["multivariate"] - acc["univariate"]
+    short = delta.loc[1:4].mean()
+    long = delta.loc[5:12].mean()
+    crosses = acc.max(axis=1).gt(0.5)
+    last_useful = int(crosses[crosses].index.max()) if crosses.any() else 0
+
+    chart = pn.pane.Plotly(build_variant_chart(df),
+                           config={"displayModeBar": True}, sizing_mode="stretch_width")
+    note = pn.pane.HTML(
+        "<div class='enso-note'><b>The extra channels do not rescue the LSTM, they "
+        "move where its skill sits.</b> Feeding it Niño-1+2/3/4, SOI, DMI, PNA and WP "
+        f"<i>costs</i> ACC across leads 1–4 ({short:+.3f} mean), where ONI persistence "
+        "already carries the forecast and the extra inputs are mostly noise. From lead 5 "
+        f"out it gains ({long:+.3f} mean), holding ACC near 0.34–0.41 through months "
+        "8–12 while the ONI-only control collapses towards zero, the range past the "
+        "spring predictability barrier. Read it as a real but <b>sub-threshold</b> "
+        f"signal: nothing beyond lead {last_useful} clears the 0.5 useful-skill line in "
+        "<i>either</i> arm, so this does not extend the usable horizon and does not "
+        "change which model the ensemble averages. PDO and TNI are excluded, both run "
+        "months behind, and the forward window needs every channel complete.</div>",
+        sizing_mode="stretch_width")
+    return pn.Row(pn.Column(chart, css_classes=["enso-card"]), note,
+                  sizing_mode="stretch_width")
+
+
+def build_analog_chart(df: pd.DataFrame) -> go.Figure:
+    """Every analog's forward ONI path, drawn individually.
+
+    Deliberately NOT a mean line with a band. The current analog set is bimodal — three
+    paths run to a strong event, two fade — and an average of those two outcomes is a
+    number that never happened and never will. Showing the paths shows the disagreement,
+    which is the actual information.
+    """
+    fig = go.Figure()
+    for rank in sorted(df["rank"].unique()):
+        g = df[df["rank"] == rank].sort_values("lead")
+        label = f"{g['analog_date'].iloc[0]:%b %Y}"
+        peak = float(g["oni_fwd"].max())
+        colour = COLORS["el_nino"] if peak >= 1.0 else COLORS["neutral"]
+        fig.add_trace(go.Scatter(
+            x=g["lead"], y=g["oni_fwd"], mode="lines+markers", name=label,
+            line=dict(color=colour, width=2.2), marker=dict(size=5),
+            hovertemplate=f"{label}<br>+%{{x}} mo: %{{y:+.2f}}<extra></extra>"))
+    for level in (0.5, -0.5):
+        fig.add_hline(y=level, line=dict(color="rgba(138,148,166,0.35)", dash="dot"))
+    style_figure(
+        fig, height=330, margin=dict(l=50, r=14, t=44, b=42),
+        title=dict(text="What followed each analog, ONI path after the matched month",
+                   font=dict(size=14)),
+        xaxis=dict(title="months after the analog"),
+        yaxis=dict(title="ONI (°C)"),
+        legend=dict(orientation="h", y=-0.24))
+    return fig
+
+
+def _analog_card() -> pn.viewable.Viewable:
+    """Analog panel, or a quiet note if the cache is absent. Never breaks the page."""
+    try:
+        import sys as _sys
+        _proc = Path(__file__).resolve().parents[2] / "data" / "process"
+        if str(_proc) not in _sys.path:
+            _sys.path.insert(0, str(_proc))
+        from analogs import ANALOG_VERSION, get_analogs
+        df = get_analogs()
+    except Exception as exc:  # noqa: BLE001
+        return pn.pane.HTML(
+            f"<div class='enso-note'>Analog engine unavailable ({exc}).</div>")
+    if df.empty:
+        return pn.pane.HTML("<div class='enso-note'>No analogs computed.</div>")
+
+    query = df["query_date"].iloc[0]
+    ends = df[df["lead"] == df["lead"].max()]
+    strong = int((df.groupby("rank")["oni_fwd"].max() >= 1.0).sum())
+    total = df["rank"].nunique()
+    rows = "".join(
+        f"<tr><td>#{int(r['rank'])}</td><td><b>{r['analog_date']:%b %Y}</b></td>"
+        f"<td>d={r['distance']:.2f}</td>"
+        f"<td>{float(df[(df['rank'] == r['rank']) & (df['lead'] == 6)]['oni_fwd'].iloc[0]):+.2f}</td>"
+        f"<td>{float(r['oni_fwd']):+.2f}</td></tr>"
+        for _, r in ends.sort_values("rank").iterrows())
+    table = (
+        "<table style='width:100%;border-collapse:collapse;font-size:11.5px'>"
+        "<tr style='color:#8a94a6;font:700 9px ui-monospace,monospace;"
+        "letter-spacing:.7px;text-transform:uppercase'><th align='left'>Rank</th>"
+        "<th align='left'>Analog month</th><th align='left'>Distance</th>"
+        "<th align='left'>+6 mo</th><th align='left'>+12 mo</th></tr>" + rows + "</table>")
+
+    note = pn.pane.HTML(
+        f"<div class='enso-note'><b>Analogs for {query:%b %Y}.</b> The five closest "
+        "historical states, ranked by Euclidean distance over the ONI trajectory "
+        "(t−6…t), the Niño 1+2/3/4 pattern, SOI and DMI, all z-scored. "
+        f"<b>{strong} of {total}</b> went on to reach ONI ≥ +1.0; the rest faded. That "
+        "split is the point: the mean of a bimodal set is an outcome that never occurred, "
+        "so the paths are drawn individually rather than averaged. Neighbouring months are "
+        "excluded (they share most of their trajectory), and every analog has a full "
+        f"12-month observed future. <span style='opacity:.7'>{ANALOG_VERSION}</span>"
+        f"<div style='margin-top:9px'>{table}</div></div>")
+    chart = pn.pane.Plotly(build_analog_chart(df), config={"displayModeBar": False},
+                           sizing_mode="stretch_width")
+    return pn.Row(pn.Column(chart, css_classes=["enso-card"]), note,
+                  sizing_mode="stretch_width")
+
+
+def build_app() -> pn.viewable.Viewable:
+    history = load_oni()[["date", "oni"]]
+    forecasts = pd.read_parquet(CACHE_DIR / "forecasts_all.parquet")
+    skill = pd.read_parquet(CACHE_DIR / "skill_all.parquet")
+
+    header = pn.pane.HTML(
+        "<div><p class='enso-title'>🔮 Forecast</p>"
+        "<p class='enso-subtitle'>SARIMA · LSTM · Ensemble · verified vs persistence · "
+        f"index: <b style='color:{COLORS['teal']}'>ONI</b></p></div>")
+
+    fan = pn.pane.Plotly(build_fan_chart(history, forecasts),
+                         config={"displayModeBar": True}, sizing_mode="stretch_width")
+    skl = pn.pane.Plotly(build_skill_chart(skill),
+                         config={"displayModeBar": True}, sizing_mode="stretch_width")
+
+    warn = pn.pane.HTML(
+        "<div class='enso-warn'><b>Never trust a single forecast.</b> The shaded "
+        "bands are prediction intervals; the spread <i>between</i> models, and "
+        "between these statistical baselines and CPC's dynamical models (which "
+        "expect a stronger event), is the real signal. Our linear/recurrent "
+        "baselines mean-revert and under-call strong events; coupled dynamical "
+        "models (and the ERA5 CNN track) capture growth dynamics they cannot. "
+        "Skill (ACC) typically falls below the useful 0.5 line beyond ~6–8 months, "
+        "the ENSO spring predictability barrier. Index: ONI (see Monitor for the "
+        "RONI caveat).</div>")
+
+    # Live receipt for the under-calling caveat above: the newest OBSERVED weekly
+    # Niño-3.4 anomaly next to the ensemble's nearest-month mean. Deliberately does
+    # NOT compute a verdict — they are different quantities (single week of OISST vs
+    # a 3-month-mean ONI forecast), so the reader is shown both, not a comparison.
+    wk = latest_weekly()
+    if wk is not None:
+        ens = forecasts[forecasts["model"] == "Ensemble"].sort_values("date")
+        near = f"{float(ens.iloc[0]['mean']):+.2f}°C ({ens.iloc[0]['date']:%b %Y})" \
+            if len(ens) else "n/a"
+        nowcast = pn.pane.HTML(
+            "<div class='enso-note'><b>Observed vs forecast, right now.</b> Latest "
+            f"weekly Niño-3.4 anomaly <b>{wk.anom:+.1f}°C</b> (wk ctr. "
+            f"{wk.week_date:%d %b %Y}, 4-wk {wk.anom_4wk:+.2f}°C) against this "
+            f"ensemble's nearest month <b>{near}</b>. These are <i>not</i> the same "
+            "quantity, one is a single week of OISST, the other a 3-month-mean ONI "
+            "forecast, so read the gap as context for the under-calling noted above, "
+            "not as a scored error.</div>")
+    else:
+        nowcast = pn.pane.HTML(
+            "<div class='enso-note'>Live weekly Niño-3.4 feed unavailable.</div>")
+
+    return pn.Column(
+        header, pn.Spacer(height=8),
+        pn.Column(fan, css_classes=["enso-card"]), pn.Spacer(height=8),
+        pn.Column(skl, css_classes=["enso-card"]), pn.Spacer(height=8),
+        nowcast, pn.Spacer(height=8), _analog_card(), pn.Spacer(height=8),
+        _variant_card(), pn.Spacer(height=8), warn,
+        styles={"background": COLORS["bg"], "padding": "22px",
+                "min-height": "100vh", "max-width": "1500px", "margin": "0 auto"})
+
+
+build_app().servable(title="ENSO Forecast")

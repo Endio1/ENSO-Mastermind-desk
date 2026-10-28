@@ -1,0 +1,595 @@
+"""Unit tests for the pure (network-free) core logic.
+
+Run either way::
+
+    python tests/test_core.py        # no extra deps
+    pytest tests/test_core.py        # if pytest installed
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_ROOT / "data" / "process"))
+sys.path.insert(0, str(_ROOT / "data" / "ingest"))
+sys.path.insert(0, str(_ROOT / "forecasting" / "verification"))
+
+from enso_phase_labeler import (  # noqa: E402
+    classify_intensity,
+    event_summary,
+    label_phases,
+    simple_phase,
+)
+from lag_correlator import (  # noqa: E402
+    detrend,
+    lagged_cross_correlation,
+)
+from granger_ccm import ccm_convergence  # noqa: E402
+from weekly_nino34 import parse_weekly  # noqa: E402
+from source_registry import Source, _status  # noqa: E402
+from climate_indices import parse_dmi_csv, parse_psl_data  # noqa: E402
+from analogs import (  # noqa: E402
+    EXCLUDE_MONTHS,
+    FORWARD_MONTHS,
+    POINT_INDICES,
+    find_analogs,
+    state_matrix,
+)
+from exposure_index import EXPOSURE_VERSION, REGISTRY  # noqa: E402
+from positioning import (  # noqa: E402
+    DIVERGENCE_TOL,
+    IMPACT_FLOOR,
+    STANCE_VERSION,
+    conviction,
+    regime_label,
+    stance,
+)
+from skill_metrics import acc, msss, rmse, skill_by_lead  # noqa: E402
+
+
+def _seasons(values: list[float]) -> pd.DataFrame:
+    """Build a minimal monthly ONI-like frame from a list of values."""
+    dates = pd.date_range("2000-01-01", periods=len(values), freq="MS")
+    return pd.DataFrame(
+        {
+            "date": dates,
+            "season": [f"S{i}" for i in range(len(values))],
+            "year": dates.year,
+            "oni": values,
+        }
+    )
+
+
+def test_simple_phase_thresholds() -> None:
+    assert simple_phase(0.6) == "El Nino"
+    assert simple_phase(-0.6) == "La Nina"
+    assert simple_phase(0.3) == "Neutral"
+    assert simple_phase(float("nan")) == "Neutral"
+
+
+def test_classify_intensity_tiers() -> None:
+    assert classify_intensity(0.7) == "Weak"
+    assert classify_intensity(1.2) == "Moderate"
+    assert classify_intensity(1.7) == "Strong"
+    assert classify_intensity(2.3) == "Very Strong"
+
+
+def test_event_requires_five_consecutive_seasons() -> None:
+    # A 4-season warm run is NOT an event; a 5-season run IS.
+    four = _seasons([0.6, 0.7, 0.8, 0.7, 0.1, 0.0])
+    labeled4 = label_phases(four)
+    assert (labeled4["phase_event"] == "El Nino").sum() == 0
+
+    five = _seasons([0.6, 0.7, 0.8, 0.9, 0.7, 0.1])
+    labeled5 = label_phases(five)
+    assert (labeled5["phase_event"] == "El Nino").sum() == 5
+    summary = event_summary(labeled5)
+    assert len(summary) == 1
+    assert summary.iloc[0]["phase"] == "El Nino"
+    assert summary.iloc[0]["intensity"] == "Weak"  # peak 0.9
+
+
+def test_detrend_removes_linear_trend() -> None:
+    x = pd.Series(np.arange(100, dtype=float) * 2.0 + 5.0)
+    d = detrend(x)
+    assert abs(d.mean()) < 1e-9
+    assert d.std() < 1e-6  # a pure line detrends to ~zero
+
+
+def test_lagged_correlation_recovers_known_lag() -> None:
+    rng = np.random.default_rng(0)
+    idx = pd.date_range("1990-01-01", periods=240, freq="MS")
+    driver = pd.Series(rng.standard_normal(240), index=idx)
+    # target = driver delayed by 6 months -> peak |r| should be at lag 6.
+    target = driver.shift(6) + rng.standard_normal(240) * 0.05
+    ccf = lagged_cross_correlation(
+        driver, target, max_lag=24, do_detrend=False
+    )
+    assert int(ccf.abs().idxmax()) == 6
+    assert ccf.loc[6] > 0.9
+
+
+def test_skill_metrics_basic() -> None:
+    obs = [0.0, 1.0, 2.0, 3.0]
+    perfect = [0.0, 1.0, 2.0, 3.0]
+    assert rmse(obs, perfect) == 0.0
+    assert acc(obs, perfect) == 1.0
+    # A forecast equal to obs has MSSS = 1 vs a worse reference.
+    worse = [1.0, 1.0, 1.0, 1.0]
+    assert msss(obs, perfect, worse) == 1.0
+
+
+def test_skill_by_lead_shape() -> None:
+    bt = pd.DataFrame(
+        {
+            "lead": [1, 1, 2, 2],
+            "actual": [0.5, 0.6, 0.7, 0.8],
+            "pred": [0.5, 0.6, 0.65, 0.85],
+            "persistence": [0.0, 0.0, 0.0, 0.0],
+        }
+    )
+    sk = skill_by_lead(bt)
+    assert list(sk["lead"]) == [1, 2]
+    assert (sk["rmse"] >= 0).all()
+
+
+def test_ccm_recovers_coupling_direction() -> None:
+    # Build x -> y coupling: y depends on lagged x, x is independent.
+    rng = np.random.default_rng(1)
+    n = 400
+    x = np.zeros(n)
+    y = np.zeros(n)
+    for t in range(1, n):
+        x[t] = 0.7 * x[t - 1] + rng.standard_normal() * 0.3
+        y[t] = 0.3 * y[t - 1] + 0.6 * x[t - 1] + rng.standard_normal() * 0.1
+    idx = pd.date_range("1980-01-01", periods=n, freq="MS")
+    driver, target = pd.Series(x, index=idx), pd.Series(y, index=idx)
+    ccm = ccm_convergence(driver, target, E=3, tau=1, lib_steps=6)
+    fwd = ccm[ccm["direction"] == "ONI->target"].sort_values("lib_size")["rho"]
+    # x drives y, so y's manifold encodes x: forward cross-map (recovering the
+    # driver from the target manifold) must achieve clear positive skill. (The
+    # fwd>rev asymmetry only holds for *weak* coupling, so we don't assert it.)
+    assert fwd.notna().all()
+    assert fwd.iloc[-1] > 0.3
+
+
+def test_weekly_nino34_parses_runtogether_negative() -> None:
+    """A negative anomaly is glued to the SST ("26.8-0.1") in the CPC weekly file.
+
+    That is the one case a naive ``str.split()`` gets wrong — it yields 7 fields
+    instead of 8 and silently shifts every column. Header lines must be ignored.
+    """
+    text = (
+        "Weekly SST data starts week centered on 2Sept1981\n"
+        "                Nino1+2      Nino3        Nino34        Nino4\n"
+        " Week          SST SSTA     SST SSTA     SST SSTA     SST SSTA\n"
+        " 04MAR2026     27.6 1.0     27.0 0.2     26.8-0.1     28.2 0.1\n"
+        " 22JUL2026     25.4 3.8     28.1 2.5     29.3 2.2     29.8 1.0\n"
+    )
+    df = parse_weekly(text)
+    assert len(df) == 2, "header lines must not be parsed as data"
+    assert df.iloc[0]["week_date"] == pd.Timestamp("2026-03-04")
+    assert df.iloc[0]["nino34_anom"] == -0.1   # the run-together case
+    assert df.iloc[0]["nino34_sst"] == 26.8
+    assert df.iloc[1]["nino34_anom"] == 2.2
+
+
+def test_stance_causal_gate_outranks_magnitude() -> None:
+    """A WEAK or untested causal verdict is capped at WATCH however big the impact.
+
+    This is the misattribution guard applied to the *prescription*. If it ever regresses,
+    the desk starts issuing directional views on links CCM could not confirm.
+    """
+    assert stance(2.0, "weak") == ("● WATCH", "watch")
+    assert stance(-2.0, "weak") == ("● WATCH", "watch")
+    assert stance(2.0, "untested") == ("● WATCH", "watch")
+    assert stance(2.0, "none") == ("● WATCH", "watch")
+    # ...but a CAUSAL link must be allowed through. landing_causation emits "causal",
+    # not "strong" — gating on the wrong literal silently muzzles the best links.
+    assert stance(0.9, "causal")[0] == "▲ CONSTRUCTIVE"
+    # A confirmed link still has to clear the noise floor.
+    assert stance(IMPACT_FLOOR / 2, "mod") == ("● WATCH", "watch")
+    # ...and only then does the sign of r_peak * state pick the direction.
+    assert stance(0.9, "mod")[0] == "▲ CONSTRUCTIVE"
+    assert stance(-0.9, "mod")[0] == "▼ CAUTIOUS"
+    assert stance(float("nan"), "mod") == ("● WATCH", "watch")
+
+
+def test_conviction_haircut_on_model_observation_split() -> None:
+    """Models disagreeing with the observation costs a notch; bounds stay 1..4."""
+    base = conviction(0.3, "mod", None)
+    assert conviction(0.3, "mod", DIVERGENCE_TOL + 0.5) == base - 1
+    assert conviction(0.3, "mod", DIVERGENCE_TOL - 0.5) == base   # inside tolerance
+    assert conviction(5.0, "causal", None) == 4                   # capped
+    assert conviction(0.0, "untested", 9.0) == 1                  # floored
+
+
+def test_regime_label_flags_trajectory_from_weekly() -> None:
+    """The ONI lags ~2.5 months; the live weekly says whether it is still moving."""
+    when = pd.Timestamp("2026-05-01")
+    assert regime_label(0.98, when) == "WEAK EL NIÑO · 2026"
+    assert regime_label(0.98, when, weekly=2.15).endswith("STRENGTHENING")
+    assert regime_label(0.98, when, weekly=1.0) == "WEAK EL NIÑO · 2026"  # gap < tol
+    assert regime_label(-1.2, when, weekly=-2.4).startswith("MODERATE LA NIÑA")
+    assert regime_label(0.1, when, weekly=0.2).startswith("NEUTRAL")
+
+
+def test_freshness_subtracts_structural_label_lag() -> None:
+    """A perfectly current ONI must NOT read stale just because of its centre-month label.
+
+    The ONI is a 3-month mean stored under its centre month, so an on-schedule value is
+    ~75 days old *by its own label*. Judging raw age against a 31-day cadence flags it
+    stale forever — which is exactly the false alarm this registry exists to prevent.
+    """
+    oni = Source("ONI", "feed", "u", 31, "oni.parquet", expected_lag_days=75)
+    assert _status(oni, 98 - 75) == "FRESH"     # on schedule
+    assert _status(oni, 98) == "STALE"          # what the naive raw-age check would say
+    assert _status(oni, 55) == "AGING"          # genuinely a publication late
+    # Deliberate cutoffs are decisions, not neglect — never STALE however old.
+    pink = Source("Pink Sheet", "snapshot", "u", None, "commodities.parquet")
+    assert _status(pink, 5_000) == "SNAPSHOT"
+    assert _status(Source("IMD", "static", "u", None, "m.parquet"), 9_999) == "STATIC"
+    assert _status(Source("X", "computed", "u", 31, "nope.parquet"), None) == "MISSING"
+
+
+def test_psl_data_parser_reads_sentinel_from_file() -> None:
+    """PSL files carry their own missing-value sentinel; assuming one corrupts real data.
+
+    Not every file uses -99.99. Hard-coding it would turn a genuine -9.9 reading into a
+    data point in a file that uses -9.9 as its sentinel, and vice versa. The footer text
+    after the sentinel line must also not be parsed as data.
+    """
+    text = (
+        "        1950        1951\n"
+        "1950   0.10  -0.20 -99.99 -99.99 -99.99 -99.99 "
+        "-99.99 -99.99 -99.99 -99.99 -99.99 -99.99\n"
+        "1951  -4.00 -99.99 -99.99 -99.99 -99.99 -99.99 "
+        "-99.99 -99.99 -99.99 -99.99 -99.99 -99.99\n"
+        "  -99.99\n"
+        "  SOI Index from CPC\n"
+        " https://psl.noaa.gov/data/timeseries/month/for info\n"
+    )
+    df = parse_psl_data(text)
+    assert len(df) == 3, "sentinels must be dropped and the footer ignored"
+    assert df.iloc[0]["date"] == pd.Timestamp("1950-01-01")
+    assert df.iloc[0]["value"] == 0.10
+    assert df.iloc[2]["value"] == -4.00        # a large negative that is NOT the sentinel
+
+
+def test_dmi_parser_drops_future_padding() -> None:
+    """The DMI csv pads the rest of the current year with -9999; keeping it would make
+    "latest DMI" report December of this year with a garbage value."""
+    text = ("Date, DMI HadISST1.1  missing value -9999\n"
+            "1870-01-01,   -0.438\n"
+            "2026-05-01,    0.310\n"
+            "2026-06-01,-9999.000\n"
+            "2026-12-01,-9999.000\n")
+    df = parse_dmi_csv(text)
+    assert len(df) == 2
+    assert df["date"].max() == pd.Timestamp("2026-05-01")
+
+
+def test_analogs_exclude_neighbours_and_rank_by_distance() -> None:
+    """Neighbouring months are near-duplicates and must not be returned as analogs.
+
+    Adjacent months share 6 of 7 trajectory features, so without the exclusion window the
+    "closest analog" to May 2026 is simply April 2026 — trivially true and useless. Also
+    checks every analog has a full forward window, since a match with no observed future
+    cannot answer the question being asked.
+    """
+    idx = pd.date_range("1950-01-01", "2020-12-01", freq="MS")
+    rng = np.random.default_rng(0)
+    oni = pd.Series(np.sin(np.arange(len(idx)) / 11.0) + rng.normal(0, 0.05, len(idx)),
+                    index=idx)
+    feats = pd.DataFrame({name: rng.normal(0, 1, len(idx)) for name in POINT_INDICES},
+                         index=idx)
+    states = state_matrix(oni, feats)
+
+    query = states.index[-1]
+    res = find_analogs(query, top_k=4, states=states, oni=oni)
+    dates = res["analog_date"].unique()
+
+    assert query not in dates, "the query month must never be its own analog"
+    for d in dates:
+        gap = abs((d.year - query.year) * 12 + (d.month - query.month))
+        assert gap > EXCLUDE_MONTHS, f"{d:%Y-%m} is inside the exclusion window"
+        assert d + pd.DateOffset(months=FORWARD_MONTHS) <= oni.index[-1]
+    # rank 1 must be the closest match
+    first = res[res["lead"] == 0].sort_values("rank")["distance"].to_list()
+    assert first == sorted(first), "ranks must be ordered by ascending distance"
+
+
+def test_methodology_doc_matches_code() -> None:
+    """The published methodology may not silently drift from the code it describes.
+
+    Weights and thresholds are only credible if the document is provably in sync, so this
+    fails when a registry row is added without documenting it, or when a version constant
+    is bumped without a changelog entry quoting it.
+    """
+    doc = (_ROOT / "docs" / "METHODOLOGY.md").read_text(encoding="utf-8")
+    for iso3, name, commodity, _e, _sign in REGISTRY:
+        assert iso3 in doc, f"{iso3} ({name}, {commodity}) missing from METHODOLOGY.md"
+    assert EXPOSURE_VERSION in doc, "METHODOLOGY.md does not quote the current EXPOSURE_VERSION"
+    assert STANCE_VERSION in doc, "METHODOLOGY.md does not quote the current STANCE_VERSION"
+    # Every verdict class the gate can receive must be documented, so a reader can tell
+    # which links are allowed to carry a direction.
+    for cls in ("CAUSAL", "MODERATE", "WEAK", "NONE"):
+        assert cls in doc, f"verdict class {cls} undocumented"
+
+
+def _marked_block(text: str, tag: str) -> str:
+    """Return the text between ``<!-- tag:start -->`` and ``<!-- tag:end -->``."""
+    start, end = f"<!-- {tag}:start -->", f"<!-- {tag}:end -->"
+    assert start in text and end in text, f"missing {tag} markers"
+    return text.split(start, 1)[1].split(end, 1)[0]
+
+
+def _normalize_copy(text: str) -> str:
+    """Collapse whitespace and drop markdown link targets, keeping visible prose.
+
+    The same paragraph is hard-wrapped differently in each file, and the relative path to
+    METHODOLOGY.md necessarily differs between a doc inside ``docs/`` and one at the repo
+    root. Neither is drift. Comparing the words a reader actually sees is.
+    """
+    return " ".join(re.sub(r"\]\([^)]*\)", "]", text).split())
+
+
+def test_about_copy_is_single_sourced() -> None:
+    """The three published descriptions of this project may not disagree with each other.
+
+    They already did once: the README, the Space card and METHODOLOGY.md each carried
+    their own answer to "what is this", and the page count went stale in all three while
+    the Space card still described six causal links and eight pages. Prose that is copied
+    by hand rots by hand, so the copies are now generated from docs/ABOUT.md and this
+    fails the moment one of them is edited in place.
+    """
+    about = (_ROOT / "docs" / "ABOUT.md").read_text(encoding="utf-8")
+    canon = _normalize_copy(_marked_block(about, "about"))
+    oneline = _normalize_copy(_marked_block(about, "oneline"))
+    assert len(canon) > 400, "the canonical About block looks truncated"
+
+    for rel in ("README.md", "deploy/hf/README.md"):
+        text = (_ROOT / rel).read_text(encoding="utf-8")
+        copy = _normalize_copy(_marked_block(text, "about"))
+        assert copy == canon, (
+            f"{rel} has drifted from docs/ABOUT.md. Edit docs/ABOUT.md and paste the "
+            f"block back into the about:start/about:end markers."
+        )
+
+    layout = (_ROOT / "web" / "app" / "layout.tsx").read_text(encoding="utf-8")
+    assert oneline.strip('"') in _normalize_copy(layout), (
+        "web/app/layout.tsx meta description no longer matches the one-liner in "
+        "docs/ABOUT.md"
+    )
+
+
+def test_user_facing_copy_has_no_em_dashes() -> None:
+    """House style: user-facing copy uses no em dash, and no hyphen standing in for one.
+
+    An em dash is not a bug, but it is the tell of unedited machine prose, and the fix of
+    swapping in a spaced hyphen is worse than the problem. Recast with a comma, a colon or
+    a full stop. This covers the published prose files; en dashes in numeric ranges such
+    as 1950-2026 are correct and are not touched.
+    """
+    published = [
+        "README.md", "docs/ABOUT.md", "docs/METHODOLOGY.md",
+        "deploy/hf/README.md", "web/app/layout.tsx", "web/app/page.tsx",
+    ]
+    offenders = {}
+    for rel in published:
+        path = _ROOT / rel
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        hits = text.count("—") + text.count("&mdash;")
+        if hits:
+            offenders[rel] = hits
+    assert not offenders, f"em dashes in user-facing copy: {offenders}"
+
+
+def test_lstm_exog_channels_feed_input_only_and_reject_gaps() -> None:
+    """Extra channels must widen the INPUT without becoming extra targets — or raise.
+
+    Two ways this silently goes wrong. First, a windowing bug that draws ``y`` from all
+    channels turns the head into a joint forecast of every series and quietly changes what
+    the ONI column even means. Second, an exogenous channel that does not cover the span
+    gets standardized around its own NaNs; the model then trains on a hole. The forecast
+    still comes out looking perfectly reasonable in both cases, which is exactly why this
+    is checked rather than eyeballed.
+    """
+    import numpy as np
+
+    sys.path.insert(0, str(_ROOT / "forecasting" / "ml_models"))
+    from lstm_enso import HORIZON, WINDOW, _make_windows, run
+
+    n_ch = 3
+    vals = np.arange(60 * n_ch, dtype=np.float32).reshape(60, n_ch)
+    X, y = _make_windows(vals, end_inclusive=59)
+    assert X.shape[1:] == (WINDOW, n_ch), f"input lost its channels: {X.shape}"
+    assert y.ndim == 2 and y.shape[1] == HORIZON, f"target is not ONI-only: {y.shape}"
+    # y must be channel 0 of the months that follow the window, not a blend of channels.
+    assert np.array_equal(y[0], vals[WINDOW : WINDOW + HORIZON, 0])
+
+    idx = pd.date_range("2000-01-01", periods=60, freq="MS")
+    oni = pd.Series(np.sin(np.arange(60) / 6.0), index=idx)
+    short = pd.DataFrame({"SOI": np.cos(np.arange(60) / 5.0)}, index=idx)
+    short.iloc[-4:] = np.nan  # a laggard index that stops before the ONI does
+    try:
+        run(oni, exog=short, epochs=1)
+    except ValueError as exc:
+        assert "gap" in str(exc).lower(), f"wrong error for a gapped channel: {exc}"
+    else:
+        raise AssertionError("a gapped exogenous channel was accepted and filled")
+
+
+def test_api_loaders_emit_strict_json() -> None:
+    """Every endpoint must serialize under ``allow_nan=False``.
+
+    ``json.dumps`` will happily write bare ``NaN``/``Infinity``, which is not JSON. Python
+    and JavaScript's ``JSON.parse`` disagree about accepting it, so the failure surfaces
+    as one client seeing a null and another throwing — and a missing r_peak or ccm_rho is
+    exactly the sort of field that goes NaN. A published verification surface that emits
+    invalid JSON undercuts the only thing it exists to do, so this asserts strictness
+    rather than trusting the writer.
+    """
+    sys.path.insert(0, str(_ROOT / "dashboard"))
+    from api import LOADERS, api_patterns
+
+    assert len(api_patterns()) == 2, "index and per-endpoint routes must both mount"
+    for name, (loader, desc) in LOADERS.items():
+        payload = loader()
+        json.dumps(payload, allow_nan=False)  # raises on NaN/Inf
+        assert desc, f"endpoint {name} has no description for the /api index"
+        assert payload not in ([], {}, None), f"endpoint {name} returned nothing"
+
+
+def test_phase_randomize_preserves_spectrum() -> None:
+    """The surrogate must keep the power spectrum and destroy only the phases.
+
+    If it altered the amplitude spectrum it would no longer be a null for *this* series
+    — the comparison would silently become "coupled series vs some other series", and a
+    link could pass simply by being smoother than its own surrogates. The DC and Nyquist
+    bins are real-valued, so rotating them would leak an imaginary component back into
+    a signal that must stay real.
+    """
+    from granger_ccm import phase_randomize
+
+    rng = np.random.default_rng(7)
+    for n in (256, 257):  # even and odd: the Nyquist bin only exists for even n
+        x = np.cumsum(rng.normal(size=n)) + 3 * np.sin(np.arange(n) * 2 * np.pi / 12)
+        s = phase_randomize(x, rng)
+        assert len(s) == n
+        assert np.isrealobj(s), f"surrogate went complex at n={n}"
+        assert np.allclose(np.abs(np.fft.rfft(x)), np.abs(np.fft.rfft(s)), rtol=1e-8), (
+            f"amplitude spectrum not preserved at n={n}"
+        )
+        assert not np.allclose(x, s), f"surrogate is the input unchanged at n={n}"
+
+
+def test_ccm_surrogate_separates_coupling_from_shared_seasonality() -> None:
+    """The whole point: high rho on two smooth seasonal series is not evidence.
+
+    Two INDEPENDENT sine-plus-noise series cross-map at rho ~0.8 purely because they are
+    smooth and share a period. Without this null the bare rho >= 0.30 threshold was
+    partly measuring smoothness, which is how a spurious link earns a causal badge. The
+    coupled case must stay significant, or the test is just rejecting everything.
+    """
+    from granger_ccm import ccm_surrogate_test
+
+    idx = pd.date_range("1950-01-01", periods=600, freq="MS")
+    x = np.zeros(600); y = np.zeros(600); x[0], y[0] = 0.4, 0.2
+    for i in range(599):  # coupled logistic map: x drives y
+        x[i + 1] = x[i] * (3.8 - 3.8 * x[i])
+        y[i + 1] = y[i] * (3.5 - 3.5 * y[i] - 0.35 * x[i])
+    coupled = ccm_surrogate_test(pd.Series(x, index=idx), pd.Series(y, index=idx),
+                                 n_surrogates=60)
+    assert coupled["p_value"] < 0.05, f"genuine coupling rejected: {coupled}"
+
+    rng = np.random.default_rng(3)
+    season = np.sin(np.arange(600) * 2 * np.pi / 12)
+    a = pd.Series(season + rng.normal(0, 0.3, 600), index=idx)
+    b = pd.Series(season + rng.normal(0, 0.3, 600), index=idx)
+    spurious = ccm_surrogate_test(a, b, n_surrogates=60)
+    assert spurious["rho_obs"] > 0.5, "the trap only matters if raw rho looks convincing"
+    assert spurious["p_value"] > 0.05, f"shared seasonality passed as causal: {spurious}"
+
+
+def test_verdict_requires_beating_the_surrogate_null() -> None:
+    """A link that cannot beat its null is capped at WEAK regardless of rho.
+
+    And an ABSENT test must not open the gate: if the surrogate pass is skipped or errors
+    out, p is NaN, and a naive ``p < ALPHA`` on NaN is False — but a naive ``not p >= ALPHA``
+    would be True and would promote silently. This pins the safe direction.
+    """
+    sys.path.insert(0, str(_ROOT / "data" / "process"))
+    from landing_causation import _verdict
+
+    g = pd.DataFrame({"lag": range(1, 25), "f_stat": [5.0] * 24, "p_value": [0.001] * 24})
+    ccm = pd.DataFrame({
+        "lib_size": [20, 200, 900] * 2,
+        "rho": [0.10, 0.30, 0.45, 0.05, 0.06, 0.07],
+        "direction": ["ONI->target"] * 3 + ["target->ONI"] * 3,
+    })
+    strong = {"p_value": 0.002, "null_mean": 0.10, "n_surrogates": 500}
+    assert _verdict(g, ccm, strong)[1] == "causal", "a significant link should pass"
+
+    failed = {"p_value": 0.40, "null_mean": 0.44, "n_surrogates": 500}
+    assert _verdict(g, ccm, failed)[1] == "weak", "rho 0.45 inside its null must not pass"
+
+    untested = {"p_value": float("nan"), "null_mean": float("nan"), "n_surrogates": 0}
+    assert _verdict(g, ccm, untested)[1] == "weak", "a NaN p-value must not open the gate"
+    assert _verdict(g, ccm, None)[1] == "weak", "no surrogate dict must not open the gate"
+
+
+def test_emdat_parser_handles_both_export_vintages() -> None:
+    """EM-DAT renamed its columns in the 2023 rebuild; both files exist in the wild.
+
+    Also pins the two filters that keep the overlay honest. Earthquakes must not reach a
+    map of sea-surface temperature — co-plotting a tectonic event with an SST field is the
+    false association this desk spends its causal engine arguing against. And an event with
+    no start month must be dropped rather than defaulted to January, because a ±6-month
+    window query cannot tell an invented date from a real one.
+    """
+    import tempfile
+
+    sys.path.insert(0, str(_ROOT / "data" / "ingest"))
+    import emdat_disasters as em
+
+    modern = pd.DataFrame({
+        "DisNo.": ["2015-0001-IDN", "2015-0002-PER", "2015-0003-JPN", "2015-0004-CHL"],
+        "Disaster Group": ["Natural"] * 4,
+        "Disaster Type": ["Drought", "Flood", "Earthquake", "Wildfire"],
+        "ISO": ["IDN", "PER", "JPN", "CHL"],
+        "Country": ["Indonesia", "Peru", "Japan", "Chile"],
+        "Start Year": [2015, 2015, 2015, 2015],
+        "Start Month": [9, 3, 5, None],  # the Chile row has no month -> must be dropped
+        "Latitude": [-2.0, -9.1, 36.0, -33.0],
+        "Longitude": [117.0, -78.6, 138.0, -71.0],
+        "Total Deaths": [10, 20, 30, 40],
+        "Total Affected": [1000, 2000, 3000, 4000],
+        "Total Damage ('000 US$)": [100, 200, 300, 400],
+    })
+    legacy = modern.rename(columns={
+        "Disaster Type": "Dis Type", "Disaster Group": "Dis Group",
+        "Country": "Country Name", "Total Damage ('000 US$)": "Total Damages ('000 US$)",
+    })
+
+    for label, frame in (("modern", modern), ("legacy", legacy)):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "emdat.csv"
+            frame.to_csv(path, index=False)
+            df, stats = em.build(path)
+        kinds = set(df["dtype"])
+        assert "Earthquake" not in kinds, f"{label}: tectonic event reached an SST map"
+        assert kinds == {"Drought", "Flood"}, f"{label}: unexpected types {kinds}"
+        assert len(df) == 2, f"{label}: month-less row was not dropped ({len(df)} rows)"
+        assert str(df["date"].iloc[0].date()) == "2015-03-01", f"{label}: bad date build"
+        assert stats["geocoded"] == 2 and stats["geocoded_pct"] == 100.0, label
+        assert set(df.columns) >= {"date", "iso3", "dtype", "lat", "lon", "phase"}, label
+
+    # A missing export must fail with instructions, not a bare KeyError deep in pandas.
+    try:
+        em.find_export(_ROOT / "data" / "raw" / "definitely-not-here")
+    except FileNotFoundError as exc:
+        assert "public.emdat.be" in str(exc), "the error should say how to get the data"
+    else:
+        raise AssertionError("a missing EM-DAT export should raise")
+
+
+def _run() -> None:
+    tests = [v for k, v in globals().items() if k.startswith("test_")]
+    for t in tests:
+        t()
+        print(f"PASS {t.__name__}")
+    print(f"\n{len(tests)} passed.")
+
+
+if __name__ == "__main__":
+    _run()

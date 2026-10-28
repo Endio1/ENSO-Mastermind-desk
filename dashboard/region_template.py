@@ -1,0 +1,445 @@
+"""Parameterised region deep-dive builder for the ENSO Macro Risk Desk.
+
+`07_india.py` proved the layout; this generalises everything region-agnostic so a new
+region (SE Asia, Brazil, Australia, the cocoa belt, Peru, ...) is a thin config file.
+
+WHAT IS SHARED vs PER-REGION
+----------------------------
+Shared (here):  the terminal bar, thesis band, DESK VIEW (call/catalyst/risk), the
+                map + KPI rail, the Economics tab (live Granger/CCM on the region's
+                key commodity), the History tab, the footer, and all the CSS.
+Per-region:     a `RegionConfig` (identity, thesis, desk view, KPIs, hotspots, map
+                framing, commodity, history rows) PLUS an injected **Climate view** —
+                because the climate analysis differs by region (India = ENSO×IOD →
+                monsoon; Peru = coastal El Niño → floods; etc.). India passes its real
+                ENSO×IOD engine; lighter regions pass a simpler composite.
+
+A region page is then::
+
+    from region_template import RegionConfig, REGION_CSS, build_region
+    pn.extension("plotly", raw_css=[REGION_CSS], sizing_mode="stretch_width")
+    CFG = RegionConfig(...)
+    build_region(CFG, climate_view=my_climate_builder()).servable(title=...)
+"""
+
+from __future__ import annotations
+
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable
+
+import numpy as np
+import pandas as pd
+import panel as pn
+import plotly.graph_objects as go
+
+_DASH_DIR = Path(__file__).resolve().parent
+_ROOT = _DASH_DIR.parent
+for p in (_DASH_DIR, _ROOT / "data" / "process", _ROOT / "data" / "ingest"):
+    sys.path.insert(0, str(p))
+
+from theme import COLORS, load_commodities, load_phases, style_figure  # noqa: E402
+
+try:
+    from granger_ccm import analyze
+except Exception:  # noqa: BLE001
+    analyze = None
+
+AMBER = COLORS.get("amber", "#f4b13a")
+_LINE = "rgba(138,148,166,0.18)"
+
+REGION_CSS = f"""
+:host, body {{ background-color:{COLORS['bg']}; color:{COLORS['text']}; }}
+.rg-bar {{ display:flex; align-items:center; gap:12px; padding:11px 16px; background:#0a1020;
+  border:1px solid {_LINE}; border-radius:12px 12px 0 0; font:600 12px/1 ui-monospace,monospace; }}
+.rg-bar .nm {{ color:{COLORS['text']}; font-weight:700; letter-spacing:.5px; }} .rg-bar .flag {{ font-size:17px; }}
+.rg-bar .reg {{ color:{COLORS['el_nino']}; background:rgba(244,98,58,.12); border:1px solid rgba(244,98,58,.34);
+  padding:4px 8px; border-radius:5px; font-size:10px; letter-spacing:.6px; }}
+.rg-bar .live {{ margin-left:auto; color:{COLORS['el_nino']}; font-size:10.5px; }}
+.rg-thesis {{ padding:10px 16px; font-size:12.5px; line-height:1.5; color:{COLORS['muted']}; background:{COLORS['surface']}; }}
+.rg-thesis b {{ color:{COLORS['text']}; }}
+.dv {{ padding:12px 16px; border-left:3px solid {COLORS['teal']}; background:linear-gradient(180deg, rgba(0,212,180,.09), rgba(10,16,32,0) 90%); }}
+.dv-lab {{ font:700 9px ui-monospace,monospace; letter-spacing:1.4px; text-transform:uppercase; color:{COLORS['muted']}; }}
+.dv-badge {{ font:800 13px/1 ui-monospace,monospace; color:#04211d; background:{COLORS['teal']}; padding:6px 11px; border-radius:6px; letter-spacing:.5px; }}
+.dv-badge.watch {{ color:#2a1e06; background:{AMBER}; }} .dv-badge.cautious {{ color:#2a120b; background:{COLORS['el_nino']}; }}
+.dv-inst {{ font-size:14px; font-weight:800; color:{COLORS['text']}; }}
+.dv-now {{ margin-top:9px; font-size:11.5px; color:{COLORS['text']}; background:#0e1626; border:1px solid {_LINE}; border-radius:8px; padding:7px 11px; }}
+.dv-now b {{ color:{COLORS['teal']}; }}
+.dv-comp {{ margin-top:8px; font-size:11px; color:{COLORS['muted']}; background:#0b1322; border:1px dashed rgba(138,148,166,0.28);
+  border-radius:8px; padding:7px 11px; line-height:1.55; }}
+.dv-comp b {{ color:{COLORS['text']}; }} .dv-comp .ck {{ font:700 8.5px ui-monospace,monospace; letter-spacing:.8px;
+  text-transform:uppercase; color:{COLORS['teal']}; margin-right:6px; }}
+.dv-ver {{ font:700 8px ui-monospace,monospace; color:{COLORS['muted']}; opacity:.75; margin-left:6px; }}
+.dv-cell {{ background:#0e1626; border:1px solid {_LINE}; border-radius:8px; padding:8px 11px; font-size:12px; color:{COLORS['muted']}; line-height:1.4; }}
+.dv-cell b {{ color:{COLORS['text']}; }} .dv-cell .ck {{ font:700 8.5px ui-monospace,monospace; letter-spacing:.8px; text-transform:uppercase; }}
+.dv-cell.cat .ck {{ color:{COLORS['teal']}; }} .dv-cell.risk .ck {{ color:{COLORS['el_nino']}; }}
+.card {{ background:{COLORS['surface']}; border:1px solid rgba(138,148,166,0.14); border-radius:11px; padding:12px 13px; }}
+.kpi {{ background:{COLORS['surface']}; border:1px solid rgba(138,148,166,0.14); border-radius:10px; padding:9px 11px; }}
+.kpi .k {{ font-size:9px; letter-spacing:.5px; text-transform:uppercase; color:{COLORS['muted']}; }}
+.kpi .v {{ font-size:23px; font-weight:800; line-height:1.05; margin-top:2px; }}
+.lab {{ font:700 10px/1 ui-monospace,monospace; letter-spacing:1.3px; text-transform:uppercase; color:{COLORS['teal']}; margin:0 0 10px; }}
+.real {{ font:700 8px ui-monospace,monospace; letter-spacing:.6px; color:#04211d; background:{COLORS['teal']}; padding:2px 6px; border-radius:4px; margin-left:6px; }}
+.illus {{ font:700 8px ui-monospace,monospace; letter-spacing:.6px; color:#2a1e06; background:{AMBER}; padding:2px 6px; border-radius:4px; margin-left:6px; }}
+.reg .row {{ display:flex; gap:8px; font:600 11.5px ui-monospace,monospace; padding:5px 0; border-bottom:1px solid rgba(138,148,166,0.12); }}
+.reg .nm {{ width:130px; color:{COLORS['text']}; }} .reg .pv {{ color:{COLORS['muted']}; }} .reg .sig {{ margin-left:auto; color:{COLORS['teal']}; }}
+.reg .foot {{ margin-top:7px; font-size:10px; color:{COLORS['muted']}; line-height:1.5; }}
+.tk {{ margin-top:11px; font-size:11.5px; color:{COLORS['muted']}; background:#0e1626; border:1px solid {_LINE}; border-radius:8px; padding:8px 11px; line-height:1.5; }}
+.tk b {{ color:{COLORS['text']}; }} .tk .tg {{ font:700 8.5px ui-monospace,monospace; color:#04211d; background:{COLORS['teal']}; padding:3px 6px; border-radius:4px; margin-right:7px; }}
+table.hist {{ width:100%; border-collapse:collapse; font-size:12px; }}
+table.hist th {{ text-align:left; font:700 9px/1 ui-monospace,monospace; letter-spacing:.8px; text-transform:uppercase; color:{COLORS['muted']}; padding:7px 9px; border-bottom:1px solid rgba(138,148,166,0.2); }}
+table.hist td {{ padding:8px 9px; border-bottom:1px solid rgba(138,148,166,0.08); color:{COLORS['muted']}; }} table.hist td.yr {{ color:{COLORS['text']}; font-weight:700; }}
+.chip {{ font:700 9.5px ui-monospace,monospace; padding:2px 6px; border-radius:4px; }}
+.chip.bad {{ color:#2a120b; background:{COLORS['el_nino']}; }} .chip.ok {{ color:#04211d; background:{COLORS['la_nina']}; }} .chip.mid {{ color:#2a1e06; background:{AMBER}; }}
+.rg-foot {{ padding:11px 16px; border-top:1px solid {_LINE}; background:{COLORS['surface']}; font-size:10px; color:{COLORS['muted']}; line-height:1.5; border-radius:0 0 12px 12px; }}
+.rg-foot b {{ color:{COLORS['muted']}; }}
+"""
+
+
+@dataclass
+class RegionConfig:
+    name: str                                   # e.g. "INDIA"
+    flag: str                                    # emoji
+    iso3: str                                    # ISO-3 for the choropleth, e.g. "IND"
+    regime: str                                  # badge, e.g. "STRONG EL NIÑO · 2026"
+    thesis: str                                  # one-line thesis (HTML-safe)
+    desk: dict                                   # badge, instruments, sub, engine_read, catalyst, risk
+    kpis: list[tuple[str, str, str]]             # (label, value, color)
+    hotspots: list[tuple[str, float, float, float]]  # (name, lat, lon, pct) — pct<0 dry/red, >0 wet/blue
+    geo_scope: str                               # plotly geo scope, e.g. "asia"
+    geo_lat: tuple[float, float]
+    geo_lon: tuple[float, float]
+    map_title: str
+    commodity: str                               # for the live Granger/CCM economics tab
+    history_rows: list[tuple[str, str, str, str, str]]  # (event, oni, chip_cls, outcome, note)
+    causal_chain: list[tuple[str, str, str]]     # (label, value, color)
+    footer: str
+    econ_takeaway: str = ("The price link is causal and lagged, position during the season, "
+                          "ahead of the price response.")
+
+
+# ---- reusable climate exhibits ------------------------------------------
+# India and SE Asia each hand-rolled their climate view because each had a genuinely
+# region-specific analysis (ENSO x IOD; the palm composite). The remaining regions do not,
+# and three more copies of the same twenty lines would be three places for the composite
+# to drift. These are the generic exhibits: one asks "does the phase matter at all", the
+# other "at what lag" — the whole question for a region whose story is timing.
+
+def phase_composite(commodity: str) -> tuple[go.Figure, dict]:
+    """Mean YoY return of ``commodity`` by ENSO phase, computed from the caches."""
+    from theme import load_commodities, load_phases
+
+    comm = load_commodities()
+    px = (comm[comm["commodity"] == commodity].set_index("date")["price"]
+          .astype(float).sort_index())
+    yoy = px.pct_change(12) * 100.0
+    phases = load_phases()[["date", "phase_simple"]]
+    df = (pd.DataFrame({"date": yoy.index, "yoy": yoy.to_numpy()})
+          .merge(phases, on="date").dropna())
+    order = ["El Nino", "Neutral", "La Nina"]
+    means = df.groupby("phase_simple")["yoy"].mean().reindex(order)
+    counts = df.groupby("phase_simple")["yoy"].size().reindex(order)
+    colours = {"El Nino": COLORS["el_nino"], "La Nina": COLORS["la_nina"],
+               "Neutral": COLORS["neutral"]}
+    fig = go.Figure(go.Bar(
+        x=["El Niño", "Neutral", "La Niña"], y=means.values,
+        marker_color=[colours[p] for p in order],
+        text=[f"{v:+.1f}%" for v in means.values], textposition="outside"))
+    style_figure(fig, height=300, margin=dict(l=40, r=10, t=40, b=30),
+                 title=dict(text=f"{commodity} YoY return by ENSO phase",
+                            font=dict(size=14)),
+                 yaxis=dict(title="mean YoY %"))
+    return fig, {"means": {p: float(means[p]) for p in order},
+                 "n": {p: int(counts[p]) for p in order}}
+
+
+def lag_profile(commodity: str, *, max_lag: int = 24) -> tuple[go.Figure, dict]:
+    """Signed detrended correlation of ONI against ``commodity`` at lags 0..max_lag.
+
+    The composite collapses timing away — it asks whether El Niño months differ on
+    average, which for a supply shock that takes seasons to reach a price is the wrong
+    question. This keeps the lag axis, and the sign, so a peak can be read off it.
+    """
+    from lag_correlator import lagged_cross_correlation
+    from theme import load_oni
+
+    oni = load_oni().set_index("date")["oni"].astype(float).sort_index()
+    comm = load_commodities()
+    px = (comm[comm["commodity"] == commodity].set_index("date")["price"]
+          .astype(float).sort_index())
+    # Log price, matching positioning.signed_peak exactly. On raw price this chart put
+    # fishmeal's peak at r=+0.10/lag 7 while the desk badge beside it said +0.19/lag 8 —
+    # the same quantity, two answers, on one page. The estimator has to be the same one.
+    # Returns a Series indexed BY LAG, not a frame with a lag column.
+    prof = lagged_cross_correlation(
+        oni, np.log(px.where(px > 0)), max_lag=max_lag).dropna()
+    lags, r = prof.index.to_numpy(), prof.to_numpy()
+    peak_i = int(np.abs(r).argmax())
+    peak_lag, peak_r = int(lags[peak_i]), float(r[peak_i])
+
+    fig = go.Figure(go.Bar(
+        x=lags, y=r,
+        marker_color=[COLORS["la_nina"] if v > 0 else COLORS["el_nino"] for v in r]))
+    fig.add_hline(y=0, line=dict(color="rgba(138,148,166,0.5)", width=1))
+    style_figure(fig, height=300, margin=dict(l=40, r=10, t=40, b=30),
+                 title=dict(text=f"ONI → {commodity}: signed correlation by lag",
+                            font=dict(size=14)),
+                 yaxis=dict(title="detrended r"),
+                 xaxis=dict(title="lag (months, ONI leads)", dtick=3))
+    return fig, {"peak_lag": peak_lag, "peak_r": peak_r}
+
+
+# ---- shared builders -----------------------------------------------------
+def _bar(cfg: RegionConfig) -> pn.pane.HTML:
+    return pn.pane.HTML(
+        f"<div class='rg-bar'><span style='color:{COLORS['teal']}'>← MAP</span>"
+        f"<span class='flag'>{cfg.flag}</span><span class='nm'>{cfg.name}</span>"
+        f"<span class='reg'>{cfg.regime}</span>"
+        "<span class='live'>● LIVE · NOAA CPC</span></div>")
+
+
+def _thesis(cfg: RegionConfig) -> pn.pane.HTML:
+    return pn.pane.HTML(f"<div class='rg-thesis'><b>Thesis:</b> {cfg.thesis}</div>")
+
+
+def stance_from_cache(iso3: str) -> dict | None:
+    """Computed stance row for a region, or ``None`` if unavailable.
+
+    Never raises. A region page must still build on a fresh clone, or on a Space deploy
+    that predates ``data/process/positioning.py`` — it just falls back to the typed
+    defaults in the page's own ``RegionConfig``.
+    """
+    try:
+        path = _ROOT / "data" / "cache" / "positioning.parquet"
+        if not path.exists():
+            return None
+        row = pd.read_parquet(path).query("iso3 == @iso3")
+        return None if row.empty else row.iloc[0].to_dict()
+    except Exception:  # noqa: BLE001 - never break a page build over a stance
+        return None
+
+
+_MAX_LAG = 24   # the lag_correlator search window; a peak here may lie outside it
+
+
+def _horizon_txt(lag: int) -> str:
+    """Render the peak lag honestly, including the two boundary cases.
+
+    lag 0 is contemporaneous, not "0 months away"; lag 24 sits on the edge of the search
+    window, so the true peak may be further out and the number should not be trusted as
+    a horizon. Both read as bugs if printed as a bare integer.
+    """
+    if lag <= 0:
+        return "contemporaneous"
+    if lag >= _MAX_LAG:
+        return f"{lag} mo (window edge)"
+    return f"{lag} mo"
+
+
+def _apply_stance(cfg: RegionConfig) -> dict | None:
+    """Overlay the computed stance onto the config's typed defaults.
+
+    Replaced (these go stale with the regime): ``regime``, the DESK VIEW badge, and the
+    sub-line. Kept (a formula cannot see them): ``instruments``, ``catalyst``, ``risk``
+    and ``engine_read`` — the latter carries genuine per-region analysis such as India's
+    fitted P(deficient monsoon).
+    """
+    s = stance_from_cache(cfg.iso3)
+    if not s:
+        return None
+    cfg.regime = str(s["regime"])
+    cfg.desk = {**cfg.desk, "badge": str(s["badge"]), "badge_cls": str(s["badge_cls"]),
+                "sub": (f"{s['verdict']} · conviction {int(s['conviction'])}/4 · "
+                        f"horizon {_horizon_txt(int(s['horizon_mo']))} · computed")}
+    return s
+
+
+_DIRECTIONAL_CLS = ("causal", "mod")   # mirrors positioning._DIRECTIONAL_CLS
+
+
+def _causal_badge(s: dict | None) -> str:
+    """The ONI→price verdict, read from the cache rather than asserted.
+
+    This was a hardcoded teal "ONI → impact: CAUSAL · one-way (Granger + CCM converges
+    forward)" rendered on every region page. Once the surrogate null landed it was wrong
+    on all five at once: Peru showed it directly beneath a line saying the link is capped
+    at WEAK, and Brazil showed it while being UNTESTED with r ≈ −0.07. A desk whose whole
+    argument is the misattribution guard cannot hand-type the verdict it is guarding.
+
+    It also conflated two different claims. ONI→*impact* (drought, monsoon) is the link
+    the region pages actually demonstrate; ONI→*price* is the one that keeps failing. The
+    badge now names the price verdict, because that is what the parenthetical was about.
+    """
+    box = "<div class='card' style='margin-top:9px;font-size:11px;color:#c2cadb'>"
+    if not s:
+        return (f"{box}<b style='color:{COLORS['muted']}'>ONI → price: UNVERIFIED</b> · "
+                "stance cache missing; run <code>data/process/positioning.py</code>.</div>")
+    verdict = str(s.get("verdict", "UNTESTED"))
+    if str(s.get("verdict_cls", "")).lower() in _DIRECTIONAL_CLS:
+        color, tail = COLORS["teal"], "one-way (Granger and CCM converge forward)."
+    else:
+        color, tail = AMBER, ("the climate link is the one this page demonstrates; the "
+                              "price channel does not beat its surrogate null.")
+    return f"{box}<b style='color:{color}'>ONI → price: {verdict}</b> · {tail}</div>"
+
+
+def _stance_line(s: dict) -> str:
+    """The receipt: the numbers the badge was derived from, shown next to the badge."""
+    r, impact = float(s["r_peak"]), float(s["impact"])
+    direction = "higher" if r > 0 else "lower"
+    div = s.get("divergence")
+    div_txt = ""
+    if div is not None and not pd.isna(div):
+        div_txt = (f" Observed-minus-forecast <b>{float(div):+.2f} °C</b>, so the models are "
+                   "under-calling the event; conviction is haircut when that gap exceeds 1.0.")
+    override = ""
+    if str(s.get("override_reason") or ""):
+        override = (f"<br><span style='color:{AMBER}'>MANUAL OVERRIDE</span>, "
+                    f"{s['override_reason']}")
+    return (
+        f"<div class='dv-comp'><span class='ck'>Computed stance</span> "
+        f"r<sub>peak</sub> <b>{r:+.2f}</b> at <b>{_horizon_txt(int(s['horizon_mo']))}</b> "
+        f"(warm ENSO → {direction} price) × ENSO state <b>{float(s['state']):+.2f}σ</b> "
+        f"⇒ impact <b>{impact:+.2f}</b>, gated by the causal verdict "
+        f"<b>{s['verdict']}</b>.{div_txt} <span class='dv-ver'>{s['stance_version']}</span>"
+        f"{override}</div>")
+
+
+def _desk_view(cfg: RegionConfig, s: dict | None = None) -> pn.pane.HTML:
+    d = cfg.desk
+    computed = _stance_line(s) if s else ""
+    return pn.pane.HTML(
+        "<div class='dv'><div style='display:flex;align-items:center;gap:12px;flex-wrap:wrap'>"
+        "<span class='dv-lab'>Desk view</span>"
+        f"<span class='dv-badge {d.get('badge_cls', '')}'>{d['badge']}</span>"
+        f"<span class='dv-inst'>{d['instruments']}</span>"
+        f"<span class='dv-lab'>{d['sub']}</span></div>"
+        f"<div class='dv-now'>{d['engine_read']}</div>{computed}"
+        "<div style='display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:10px'>"
+        f"<div class='dv-cell cat'><span class='ck'>Catalyst</span> &nbsp;{d['catalyst']}</div>"
+        f"<div class='dv-cell risk'><span class='ck'>Key risk</span> &nbsp;{d['risk']}</div></div></div>")
+
+
+def _region_map(cfg: RegionConfig) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Choropleth(
+        locations=[cfg.iso3], locationmode="ISO-3", z=[1], showscale=False,
+        colorscale=[[0, "#7a2f1a"], [1, "#7a2f1a"]], marker_line_color="#ff8a5a",
+        marker_line_width=1, hoverinfo="skip"))
+    if cfg.hotspots:
+        # dry (pct<0) = amber/red dots; wet (pct>0) = blue dots (e.g. Peru floods)
+        cols = ["#ffce3a" if h[3] <= 0 else COLORS["la_nina"] for h in cfg.hotspots]
+        fig.add_trace(go.Scattergeo(
+            lon=[h[2] for h in cfg.hotspots], lat=[h[1] for h in cfg.hotspots],
+            mode="markers+text", showlegend=False,
+            text=[f"{h[0]} {h[3]:+.0f}%" for h in cfg.hotspots], textposition="top right",
+            textfont=dict(color="#c2cadb", size=9), hoverinfo="text",
+            marker=dict(size=[min(abs(h[3]) * 0.35, 16) for h in cfg.hotspots], color=cols,
+                        opacity=0.75, line=dict(color="#0a0e1a", width=1))))
+    style_figure(fig, height=380, margin=dict(l=4, r=4, t=30, b=4), showlegend=False,
+                 title=dict(text=cfg.map_title, font=dict(size=12, color=COLORS["muted"])))
+    fig.update_geos(scope=cfg.geo_scope, lataxis_range=list(cfg.geo_lat),
+                    lonaxis_range=list(cfg.geo_lon), showland=True, landcolor="#10182a",
+                    showcountries=True, countrycolor="#0a1224", showocean=True,
+                    oceancolor="#0a1224", bgcolor="rgba(0,0,0,0)", framecolor="rgba(0,0,0,0)")
+    return fig
+
+
+def _kpi_rail(cfg: RegionConfig) -> pn.pane.HTML:
+    cells = "".join(f"<div class='kpi'><div class='k'>{lab}</div>"
+                    f"<div class='v' style='color:{col}'>{val}</div></div>"
+                    for lab, val, col in cfg.kpis)
+    return pn.pane.HTML(f"<div style='display:grid;grid-template-columns:1fr 1fr;gap:9px'>{cells}</div>")
+
+
+def causal_chain(cfg: RegionConfig) -> pn.pane.HTML:
+    cells = "<span style='color:#5b6577;padding:0 6px'>→</span>".join(
+        f"<span style='background:#1b2235;border:1px solid {_LINE};border-radius:8px;padding:7px 9px;"
+        f"display:inline-block'><span style='font-size:8px;text-transform:uppercase;color:#5b6577'>{k}</span>"
+        f"<br><b style='font-size:11px;color:{c}'>{v}</b></span>" for k, v, c in cfg.causal_chain)
+    return pn.pane.HTML(f"<div style='display:flex;align-items:center;overflow-x:auto;margin-bottom:11px'>{cells}</div>")
+
+
+def _ccm_chart(ccm, name: str) -> go.Figure:
+    fig = go.Figure()
+    spec = {"ONI->target": (f"ONI → {name}", COLORS["teal"]),
+            "target->ONI": (f"{name} → ONI", COLORS["el_nino"])}
+    for direction, (label, color) in spec.items():
+        g = ccm[ccm["direction"] == direction].sort_values("lib_size")
+        fig.add_trace(go.Scatter(x=g["lib_size"], y=g["rho"], mode="lines+markers",
+                                 line=dict(color=color, width=2.4), name=label))
+    style_figure(fig, height=300, margin=dict(l=50, r=10, t=40, b=40),
+                 title=dict(text=f"Convergent Cross Mapping, ONI → {name}", font=dict(size=14)),
+                 yaxis=dict(title="cross-map skill ρ"), xaxis=dict(title="library size"),
+                 legend=dict(orientation="h", y=-0.25))
+    return fig
+
+
+def _econ_tab(cfg: RegionConfig) -> pn.viewable.Viewable:
+    tk = pn.pane.HTML(f"<div class='tk'><span class='tg'>TAKEAWAY</span>{cfg.econ_takeaway}</div>")
+    if analyze is None:
+        return pn.Column(pn.pane.HTML("<div class='card'>Causation engine unavailable.</div>"), tk)
+    try:
+        oni = load_phases().set_index("date")["value"].astype(float).asfreq("MS")
+        comm = load_commodities()
+        series = (comm[comm["commodity"] == cfg.commodity].set_index("date")["price"]
+                  .astype(float).asfreq("MS"))
+        res = analyze(oni, series, maxlag=24, mode="detrend")
+        short = cfg.commodity.split(",")[0]
+        chart = pn.pane.Plotly(_ccm_chart(res["ccm"], short), config={"displayModeBar": False},
+                               sizing_mode="stretch_width")
+        verdict = pn.pane.HTML(
+            f"<div class='card'><div class='lab'>Causation, ONI → {short} "
+            "<span class='real'>LIVE Granger+CCM</span></div>"
+            "<div style='font-size:12px;line-height:1.55;color:#c2cadb'><b style='color:#e8edf5'>How to "
+            "read it:</b> a forward curve (teal) that <b style='color:#e8edf5'>rises and converges</b> "
+            "while the reverse (grey) stays flat is the signature of one-way ONI→price forcing. A flat "
+            "forward curve means the apparent link is likely <b style='color:#e8edf5'>spurious</b>: the "
+            "misattribution guard. Computed live on detrended series.</div></div>")
+        body = pn.Row(pn.Column(chart, css_classes=["card"]), verdict)
+    except Exception as exc:  # noqa: BLE001
+        body = pn.pane.HTML(f"<div class='card'>Economics compute failed for "
+                            f"'{cfg.commodity}': {exc}</div>")
+    return pn.Column(body, tk, sizing_mode="stretch_width")
+
+
+def _history_tab(cfg: RegionConfig) -> pn.viewable.Viewable:
+    trs = "".join(
+        f"<tr><td class='yr'>{yr}</td><td>{oni}</td>"
+        f"<td><span class='chip {cls}'>{outcome}</span></td><td>{note}</td></tr>"
+        for yr, oni, cls, outcome, note in cfg.history_rows)
+    table = pn.pane.HTML(
+        "<table class='hist'><tr><th>Event</th><th>ONI peak</th><th>Impact</th><th>Outcome</th></tr>"
+        + trs + "</table>")
+    return pn.Column(pn.Column(table, css_classes=["card"]), sizing_mode="stretch_width")
+
+
+def build_region(cfg: RegionConfig, climate_view: pn.viewable.Viewable,
+                 agri_view: pn.viewable.Viewable | None = None) -> pn.viewable.Viewable:
+    """Assemble a full region deep-dive. `climate_view` is the region-specific exhibit.
+
+    The regime badge and DESK VIEW stance are overlaid from ``positioning.parquet`` when
+    it exists, so they track the ENSO cycle instead of the day they were typed.
+    """
+    stance = _apply_stance(cfg)
+    hero = pn.Row(
+        pn.Column(pn.pane.Plotly(_region_map(cfg), config={"displayModeBar": False},
+                                 sizing_mode="stretch_width"), css_classes=["card"]),
+        pn.Column(_kpi_rail(cfg),
+                  pn.pane.HTML(_causal_badge(stance)),
+                  width=360),
+        sizing_mode="stretch_width")
+    tabs = pn.Tabs(
+        ("Climate", climate_view),
+        ("Agriculture", agri_view or pn.pane.HTML(
+            "<div class='card' style='color:#8a94a6'>Agriculture composite, pending crop ingestion "
+            "for this region.</div>")),
+        ("Economics", _econ_tab(cfg)),
+        ("History", _history_tab(cfg)),
+        dynamic=True,
+    )
+    return pn.Column(
+        _bar(cfg), _thesis(cfg), _desk_view(cfg, stance), pn.Spacer(height=10), hero,
+        pn.Spacer(height=10), tabs, pn.pane.HTML(f"<div class='rg-foot'>{cfg.footer}</div>"),
+        styles={"background": COLORS["bg"], "padding": "22px", "min-height": "100vh",
+                "max-width": "1180px", "margin": "0 auto"}, sizing_mode="stretch_width")

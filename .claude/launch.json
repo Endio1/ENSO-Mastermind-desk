@@ -1,0 +1,31 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "desk",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["app.py"],
+      "port": 5006
+    },
+    {
+      "name": "enso-monitor",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": [
+        "-m",
+        "panel",
+        "serve",
+        "dashboard/pages/01_enso_monitor.py",
+        "--port",
+        "5009",
+        "--allow-websocket-origin=localhost:5009"
+      ],
+      "port": 5009
+    },
+    {
+      "name": "frontdoor",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["-m", "http.server", "8123", "-d", "web/out"],
+      "port": 8123
+    }
+  ]
+}
